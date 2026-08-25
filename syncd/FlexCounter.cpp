@@ -25,6 +25,13 @@ using json = nlohmann::json;
 #define MUTEX std::unique_lock<std::mutex> _lock(m_mtx);
 #define MUTEX_UNLOCK _lock.unlock();
 
+// Reconnect backoff used when the poll interval is not yet configured.
+#define FLEX_COUNTER_RECONNECT_BACKOFF_MS 1000
+
+// Log one message per this many consecutive poll failures, so that a persistent
+// COUNTERS_DB outage does not flood syslog at the poll rate.
+#define FLEX_COUNTER_POLL_FAILURE_LOG_INTERVAL 60
+
 static const std::string COUNTER_TYPE_PORT = "Port Counter";
 static const std::string ATTR_TYPE_PORT_PHY_ATTR = "Port Phy Attributes";
 static const std::string ATTR_TYPE_PORT_PHY_SERDES_ATTR = "Port Phy Serdes Attributes";
@@ -4188,21 +4195,96 @@ void FlexCounter::flexCounterThreadRunFunction()
 {
     SWSS_LOG_ENTER();
 
-    swss::DBConnector db(m_dbCounters, 0, m_isTcpConn);
-    swss::RedisPipeline pipeline(&db);
-    swss::Table countersTable(&pipeline, COUNTERS_TABLE, true);
+    // The COUNTERS_DB handles are held in rebuildable storage rather than as plain
+    // stack objects. Redis closes the connection after replying to a malformed
+    // request (CLIENT_CLOSE_AFTER_REPLY), so once a protocol error is observed the
+    // existing handles are unusable and have to be reconstructed, not merely reused.
+    std::unique_ptr<swss::DBConnector> db;
+    std::unique_ptr<swss::RedisPipeline> pipeline;
+    std::unique_ptr<swss::Table> countersTable;
+
+    auto connectCountersDb = [&]()
+    {
+        // Destroy in dependency order: Table refers to RedisPipeline, which refers
+        // to DBConnector.
+        countersTable.reset();
+        pipeline.reset();
+        db.reset();
+
+        db.reset(new swss::DBConnector(m_dbCounters, 0, m_isTcpConn));
+        pipeline.reset(new swss::RedisPipeline(db.get()));
+        countersTable.reset(new swss::Table(pipeline.get(), COUNTERS_TABLE, true));
+    };
+
+    uint64_t consecutivePollFailures = 0;
 
     while (m_runFlexCounterThread)
     {
+        if (!countersTable)
+        {
+            // Connect outside the counter mutex so that a slow or refused connect
+            // never blocks addCounter()/removeCounter() on the calling thread.
+            try
+            {
+                connectCountersDb();
+
+                SWSS_LOG_NOTICE("FC %s: COUNTERS_DB connection established",
+                        m_instanceId.c_str());
+            }
+            catch (const std::exception& e)
+            {
+                SWSS_LOG_ERROR("FC %s: failed to connect to COUNTERS_DB: %s",
+                        m_instanceId.c_str(), e.what());
+
+                uint32_t backoff = (m_pollInterval > 0) ? m_pollInterval : FLEX_COUNTER_RECONNECT_BACKOFF_MS;
+
+                std::unique_lock<std::mutex> lk(m_mtxSleep);
+
+                m_cvSleep.wait_for(lk, std::chrono::milliseconds(backoff));
+
+                continue;
+            }
+        }
+
         MUTEX;
 
         if (m_enable && !allIdsEmpty() && (m_pollInterval > 0))
         {
             auto start = std::chrono::steady_clock::now();
 
-            collectCounters(countersTable);
+            bool pollFailed = false;
 
-            runPlugins(db);
+            // A counter poll must never take down syncd. Any failure here is
+            // transient by nature (Redis I/O, protocol desync, malformed reply), so
+            // log it, drop the connection and retry on the next cycle.
+            try
+            {
+                collectCounters(*countersTable);
+
+                runPlugins(*db);
+            }
+            catch (const std::exception& e)
+            {
+                pollFailed = true;
+
+                // Rate limit: a persistent failure would otherwise log every poll interval.
+                if ((consecutivePollFailures++ % FLEX_COUNTER_POLL_FAILURE_LOG_INTERVAL) == 0)
+                {
+                    SWSS_LOG_ERROR("FC %s: poll cycle failed (%" PRIu64 " consecutive), reconnecting COUNTERS_DB: %s",
+                            m_instanceId.c_str(), consecutivePollFailures, e.what());
+                }
+            }
+
+            if (!pollFailed)
+            {
+                if (consecutivePollFailures != 0)
+                {
+                    SWSS_LOG_NOTICE("FC %s: poll cycle recovered after %" PRIu64 " failure(s)",
+                            m_instanceId.c_str(), consecutivePollFailures);
+
+                    consecutivePollFailures = 0;
+                }
+            }
 
             auto finish = std::chrono::steady_clock::now();
 
@@ -4212,6 +4294,15 @@ void FlexCounter::flexCounterThreadRunFunction()
             uint32_t correction = delay % m_pollInterval;
             correction = m_pollInterval - correction;
             MUTEX_UNLOCK; // explicit unlock
+
+            if (pollFailed)
+            {
+                // Release the handles outside the counter mutex; the next iteration
+                // reconnects. The sleep below doubles as the retry backoff.
+                countersTable.reset();
+                pipeline.reset();
+                db.reset();
+            }
 
             SWSS_LOG_DEBUG("End of flex counter thread FC %s, took %d ms", m_instanceId.c_str(), delay);
 

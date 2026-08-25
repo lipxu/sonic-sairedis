@@ -9,6 +9,7 @@
 #include <string>
 #include <chrono>
 #include <fstream>
+#include <stdexcept>
 #include <gtest/gtest.h>
 #include "swss/dbconnector.h"
 
@@ -2984,6 +2985,128 @@ TEST(FlexCounter, failedPollsCountAndCleanUp)
     waitForCounterValues(countersTable, expectedKey,
                       {"SAI_PORT_STAT_IF_IN_OCTETS", "SAI_PORT_STAT_IF_IN_ERRORS"},
                       {"100", "200"});
+
+    // Cleanup
+    fc.removeCounter(oid);
+    countersTable.del(expectedKey);
+    EXPECT_TRUE(fc.isEmpty());
+
+    std::vector<std::string> keys;
+    countersTable.getKeys(keys);
+    removeTimeStamp(keys, countersTable);
+    ASSERT_TRUE(keys.empty());
+}
+
+TEST(FlexCounter, pollLoopSurvivesThrowAndRecovers)
+{
+    // Regression test for the syncd SIGABRT on a COUNTERS_DB failure.
+    //
+    // flexCounterThreadRunFunction() runs on a std::thread with no handler, so an
+    // exception escaping the poll cycle called std::terminate() and took the whole
+    // process down. A Redis protocol error ("Protocol error: expected '$', got ...")
+    // raised from the swss layer mid-poll was enough to do it.
+    //
+    // The poll loop must instead absorb the failure, rebuild its COUNTERS_DB handles
+    // and resume publishing. Note the shape of this test: without the guard it does
+    // not fail, it *aborts the test binary* -- which is exactly the defect.
+
+    std::atomic<bool> throwFromGetStats{false};
+    std::atomic<uint32_t> throwCount{0};
+    std::atomic<uint64_t> counterBase{100};
+
+    sai->mock_queryStatsCapability = [](sai_object_id_t, sai_object_type_t,
+                                        sai_stat_capability_list_t *)
+    {
+        return SAI_STATUS_FAILURE;
+    };
+
+    sai->mock_bulkGetStats = [](sai_object_id_t, sai_object_type_t, uint32_t,
+                                const sai_object_key_t *, uint32_t,
+                                const sai_stat_id_t *, sai_stats_mode_t,
+                                sai_status_t *, uint64_t *)
+    {
+        return SAI_STATUS_FAILURE;
+    };
+
+    sai->mock_getStats = [&](sai_object_type_t, sai_object_id_t,
+                             uint32_t number_of_counters, const sai_stat_id_t *,
+                             uint64_t *counters) -> sai_status_t
+    {
+        if (throwFromGetStats.load())
+        {
+            throwCount++;
+
+            // Same exception type and message the swss Redis layer raises on a
+            // desynchronised reply stream.
+            throw std::runtime_error("Protocol error: expected '$', got 'N'");
+        }
+
+        for (uint32_t i = 0; i < number_of_counters; i++)
+        {
+            counters[i] = (i + 1) * counterBase.load();
+        }
+
+        return SAI_STATUS_SUCCESS;
+    };
+
+    test_syncd::mockVidManagerObjectTypeQuery(SAI_OBJECT_TYPE_PORT);
+
+    sai_object_id_t oid{0x1000000000000};
+    std::string expectedKey = toOid(oid);
+
+    FlexCounter fc("test", sai, "COUNTERS_DB");
+
+    std::vector<swss::FieldValueTuple> pluginValues;
+    pluginValues.emplace_back(POLL_INTERVAL_FIELD, "1000");
+    pluginValues.emplace_back(FLEX_COUNTER_STATUS_FIELD, "enable");
+    pluginValues.emplace_back(STATS_MODE_FIELD, STATS_MODE_READ);
+    fc.addCounterPlugin(pluginValues);
+
+    swss::DBConnector db("COUNTERS_DB", 0);
+    swss::RedisPipeline pipeline(&db);
+    swss::Table countersTable(&pipeline, COUNTERS_TABLE, false);
+
+    std::vector<swss::FieldValueTuple> counterValues;
+    counterValues.emplace_back(PORT_COUNTER_ID_LIST, "SAI_PORT_STAT_IF_IN_OCTETS,SAI_PORT_STAT_IF_IN_ERRORS");
+    fc.addCounter(oid, oid, counterValues);
+    EXPECT_FALSE(fc.isEmpty());
+
+    waitForCounterKeys(countersTable, 1);
+    waitForCounterValues(countersTable, expectedKey,
+                      {"SAI_PORT_STAT_IF_IN_OCTETS", "SAI_PORT_STAT_IF_IN_ERRORS"},
+                      {"100", "200"});
+
+    // Arm the throw. Every poll cycle from here raises out of collectCounters().
+    throwFromGetStats = true;
+    throwCount = 0;
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
+    while (std::chrono::steady_clock::now() < deadline && throwCount.load() < 3)
+    {
+        usleep(100 * 1000);
+    }
+
+    // Reaching this line at all is the primary assertion: the poll thread threw
+    // repeatedly and the process is still running.
+    EXPECT_GE(throwCount.load(), 3u);
+
+    // The last good values must still be there -- a failed poll goes stale, it
+    // does not clear the counters.
+    std::string value;
+    countersTable.hget(expectedKey, "SAI_PORT_STAT_IF_IN_OCTETS", value);
+    EXPECT_EQ(value, "100");
+    countersTable.hget(expectedKey, "SAI_PORT_STAT_IF_IN_ERRORS", value);
+    EXPECT_EQ(value, "200");
+
+    // Disarm and publish distinguishable values. Seeing them proves the loop kept
+    // polling and rebuilt a usable COUNTERS_DB connection, rather than merely
+    // swallowing the exception and going idle.
+    counterBase = 300;
+    throwFromGetStats = false;
+
+    waitForCounterValues(countersTable, expectedKey,
+                      {"SAI_PORT_STAT_IF_IN_OCTETS", "SAI_PORT_STAT_IF_IN_ERRORS"},
+                      {"300", "600"}, 10000);
 
     // Cleanup
     fc.removeCounter(oid);
