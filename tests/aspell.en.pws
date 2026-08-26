@@ -535,3 +535,9 @@ glibc
 getopt
 optind
 sid
+DBConnector
+SIGABRT
+backoff
+desync
+desynchronised
+rebuildable
