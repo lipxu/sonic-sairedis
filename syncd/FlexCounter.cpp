@@ -4498,6 +4498,7 @@ void FlexCounter::removeCounter(
     {
         if (hasCounterContext(ATTR_TYPE_ACL_COUNTER))
         {
+            removeDataFromCountersDB(vid, "");
             getCounterContext(ATTR_TYPE_ACL_COUNTER)->removeObject(vid);
         }
     }
