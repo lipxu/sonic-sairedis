@@ -4256,7 +4256,20 @@ void FlexCounter::flexCounterThreadRunFunction()
                 SWSS_LOG_ERROR("FC %s: failed to connect to COUNTERS_DB: %s",
                         m_instanceId.c_str(), failureReason.c_str());
 
-                uint32_t backoff = (m_pollInterval > 0) ? m_pollInterval : FLEX_COUNTER_RECONNECT_BACKOFF_MS;
+                // m_pollInterval is written by setPollInterval() with m_mtx held,
+                // so reading it here without the lock is a data race. Take a
+                // snapshot rather than holding m_mtx across the wait below: this
+                // path is deliberately outside the counter mutex so that a slow or
+                // refused connect cannot block addCounter()/removeCounter().
+                uint32_t pollInterval;
+
+                {
+                    MUTEX;
+
+                    pollInterval = m_pollInterval;
+                }
+
+                uint32_t backoff = (pollInterval > 0) ? pollInterval : FLEX_COUNTER_RECONNECT_BACKOFF_MS;
 
                 std::unique_lock<std::mutex> lk(m_mtxSleep);
 
