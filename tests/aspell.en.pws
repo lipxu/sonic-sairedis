@@ -539,5 +539,4 @@ DBConnector
 SIGABRT
 backoff
 desync
-desynchronised
 rebuildable
