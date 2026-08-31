@@ -2997,6 +2997,16 @@ TEST(FlexCounter, failedPollsCountAndCleanUp)
     ASSERT_TRUE(keys.empty());
 }
 
+namespace
+{
+    // A failure that deliberately does not derive from std::exception, standing
+    // in for a vendor SAI implementation that throws a type of its own.
+    struct VendorSpecificFailure
+    {
+        int code;
+    };
+}
+
 TEST(FlexCounter, pollLoopSurvivesThrowAndRecovers)
 {
     // Regression test for the syncd SIGABRT on a COUNTERS_DB failure.
@@ -3009,6 +3019,10 @@ TEST(FlexCounter, pollLoopSurvivesThrowAndRecovers)
     // The poll loop must instead absorb the failure, rebuild its COUNTERS_DB handles
     // and resume publishing. Note the shape of this test: without the guard it does
     // not fail, it *aborts the test binary* -- which is exactly the defect.
+    //
+    // The injected failures alternate between a std::exception and a type that
+    // does not derive from it, so a single run covers both of the loop's
+    // handlers -- the catch (...) one included.
 
     std::atomic<bool> throwFromGetStats{false};
     std::atomic<uint32_t> throwCount{0};
@@ -3034,14 +3048,22 @@ TEST(FlexCounter, pollLoopSurvivesThrowAndRecovers)
     {
         if (throwFromGetStats.load())
         {
-            throwCount++;
+            uint32_t failureNumber = throwCount++;
 
-            // Stand-in for the real failure. The swss Redis layer raises a
-            // RedisError, which derives from std::runtime_error, so throwing the
-            // base type here exercises the same catch path. The string below is the
-            // protocol error text that the real exception message embeds; it is not
-            // the whole message.
-            throw std::runtime_error("Protocol error: expected '$', got 'N'");
+            if ((failureNumber % 2) == 0)
+            {
+                // Stand-in for the real failure. The swss Redis layer raises a
+                // RedisError, which derives from std::runtime_error, so throwing
+                // the base type here exercises the same catch path. The string
+                // below is the protocol error text that the real exception message
+                // embeds; it is not the whole message.
+                throw std::runtime_error("Protocol error: expected '$', got 'N'");
+            }
+
+            // Nothing guarantees a failure arrives as a std::exception. Without the
+            // catch (...) handler this one would reach the thread boundary and
+            // terminate the process, so it must be covered too.
+            throw VendorSpecificFailure{42};
         }
 
         for (uint32_t i = 0; i < number_of_counters; i++)
