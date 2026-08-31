@@ -3036,8 +3036,11 @@ TEST(FlexCounter, pollLoopSurvivesThrowAndRecovers)
         {
             throwCount++;
 
-            // Same exception type and message the swss Redis layer raises on a
-            // desynchronised reply stream.
+            // Stand-in for the real failure. The swss Redis layer raises a
+            // RedisError, which derives from std::runtime_error, so throwing the
+            // base type here exercises the same catch path. The string below is the
+            // protocol error text that the real exception message embeds; it is not
+            // the whole message.
             throw std::runtime_error("Protocol error: expected '$', got 'N'");
         }
 
