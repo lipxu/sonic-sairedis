@@ -4242,6 +4242,11 @@ void FlexCounter::flexCounterThreadRunFunction()
                     pollInterval = m_pollInterval;
                 }
 
+                // A constant wait with no jitter. Every counter group loses
+                // COUNTERS_DB on the same cycle and so retries in lockstep, once per
+                // interval each, for as long as the outage lasts. Replacing this with
+                // a jittered, growing backoff is tracked in
+                // https://github.com/sonic-net/sonic-sairedis/issues/2065.
                 uint32_t backoff = (pollInterval > 0) ? pollInterval : FLEX_COUNTER_RECONNECT_BACKOFF_MS;
 
                 std::unique_lock<std::mutex> lk(m_mtxSleep);
@@ -4325,7 +4330,8 @@ void FlexCounter::flexCounterThreadRunFunction()
             if (pollFailed)
             {
                 // Release the handles outside the counter mutex; the next iteration
-                // reconnects. The sleep below doubles as the retry backoff.
+                // reconnects. The sleep below doubles as the retry backoff, so it is
+                // the second site that issue 2065 above applies to.
                 countersTable.reset();
                 pipeline.reset();
                 db.reset();

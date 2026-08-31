@@ -516,3 +516,10 @@ setOpAllowList
 setStatsLabel
 HWM
 allowlist
+DBConnector
+SIGABRT
+backoff
+desync
+rebuildable
+jitter
+jittered
