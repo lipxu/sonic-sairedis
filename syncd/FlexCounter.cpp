@@ -4225,6 +4225,9 @@ void FlexCounter::flexCounterThreadRunFunction()
         {
             // Connect outside the counter mutex so that a slow or refused connect
             // never blocks addCounter()/removeCounter() on the calling thread.
+            // That guarantee is deliberately narrow: it covers this connect and the
+            // handle release further down, but not the poll itself, which still runs
+            // with the counter mutex held. See the comment on the poll below.
             bool connectFailed = false;
             std::string failureReason;
 
@@ -4265,11 +4268,12 @@ void FlexCounter::flexCounterThreadRunFunction()
                             m_instanceId.c_str(), consecutiveConnectFailures, failureReason.c_str());
                 }
 
-                // m_pollInterval is written by setPollInterval() with m_mtx held,
-                // so reading it here without the lock is a data race. Take a
-                // snapshot rather than holding m_mtx across the wait below: this
-                // path is deliberately outside the counter mutex so that a slow or
-                // refused connect cannot block addCounter()/removeCounter().
+                // m_pollInterval is written with m_mtx held: setPollInterval() does
+                // not take the lock itself, but its only caller, addCounterPlugin(),
+                // does. Reading it here without the lock would therefore be a data
+                // race. Take a snapshot rather than holding m_mtx across the wait
+                // below: this path is deliberately outside the counter mutex so that
+                // a slow or refused connect cannot block addCounter()/removeCounter().
                 uint32_t pollInterval;
 
                 {
@@ -4300,6 +4304,17 @@ void FlexCounter::flexCounterThreadRunFunction()
             // A counter poll must never take down syncd. Any failure here is
             // transient by nature (Redis I/O, protocol desync, malformed reply), so
             // log it, drop the connection and retry on the next cycle.
+            //
+            // Note that, unlike the connect and the release, this runs with the
+            // counter mutex held: collecting the counters flushes the pipeline, and
+            // that blocks while reading the replies. A Redis that refuses the
+            // connection fails fast and is handled outside the lock, but one that
+            // accepts and then stops answering, blocked on a background save for
+            // instance, holds up addCounter()/removeCounter() until the socket gives
+            // up. The guard does not change where the poll is serialized, so this is
+            // no worse than before; it is worth knowing that retrying forever also
+            // means such a stall can now repeat every cycle rather than ending in an
+            // abort.
             try
             {
                 collectCounters(*countersTable);
