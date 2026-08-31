@@ -4184,6 +4184,9 @@ void FlexCounter::flexCounterThreadRunFunction()
         {
             // Connect outside the counter mutex so that a slow or refused connect
             // never blocks addCounter()/removeCounter() on the calling thread.
+            bool connectFailed = false;
+            std::string failureReason;
+
             try
             {
                 connectCountersDb();
@@ -4193,8 +4196,25 @@ void FlexCounter::flexCounterThreadRunFunction()
             }
             catch (const std::exception& e)
             {
+                connectFailed = true;
+
+                failureReason = e.what();
+            }
+            catch (...)
+            {
+                // Not every exception reaching this thread is guaranteed to derive
+                // from std::exception: a vendor SAI implementation may throw a type
+                // of its own. Letting one escape would call std::terminate(), which
+                // is precisely the abort this guard exists to prevent.
+                connectFailed = true;
+
+                failureReason = "unknown exception";
+            }
+
+            if (connectFailed)
+            {
                 SWSS_LOG_ERROR("FC %s: failed to connect to COUNTERS_DB: %s",
-                        m_instanceId.c_str(), e.what());
+                        m_instanceId.c_str(), failureReason.c_str());
 
                 uint32_t backoff = (m_pollInterval > 0) ? m_pollInterval : FLEX_COUNTER_RECONNECT_BACKOFF_MS;
 
@@ -4213,6 +4233,7 @@ void FlexCounter::flexCounterThreadRunFunction()
             auto start = std::chrono::steady_clock::now();
 
             bool pollFailed = false;
+            std::string failureReason;
 
             // A counter poll must never take down syncd. Any failure here is
             // transient by nature (Redis I/O, protocol desync, malformed reply), so
@@ -4227,23 +4248,32 @@ void FlexCounter::flexCounterThreadRunFunction()
             {
                 pollFailed = true;
 
+                failureReason = e.what();
+            }
+            catch (...)
+            {
+                // See the connect path above: an exception that does not derive from
+                // std::exception must not be allowed to reach the thread boundary.
+                pollFailed = true;
+
+                failureReason = "unknown exception";
+            }
+
+            if (pollFailed)
+            {
                 // Rate limit: a persistent failure would otherwise log every poll interval.
                 if ((consecutivePollFailures++ % FLEX_COUNTER_POLL_FAILURE_LOG_INTERVAL) == 0)
                 {
                     SWSS_LOG_ERROR("FC %s: poll cycle failed (%" PRIu64 " consecutive), reconnecting COUNTERS_DB: %s",
-                            m_instanceId.c_str(), consecutivePollFailures, e.what());
+                            m_instanceId.c_str(), consecutivePollFailures, failureReason.c_str());
                 }
             }
-
-            if (!pollFailed)
+            else if (consecutivePollFailures != 0)
             {
-                if (consecutivePollFailures != 0)
-                {
-                    SWSS_LOG_NOTICE("FC %s: poll cycle recovered after %" PRIu64 " failure(s)",
-                            m_instanceId.c_str(), consecutivePollFailures);
+                SWSS_LOG_NOTICE("FC %s: poll cycle recovered after %" PRIu64 " failure(s)",
+                        m_instanceId.c_str(), consecutivePollFailures);
 
-                    consecutivePollFailures = 0;
-                }
+                consecutivePollFailures = 0;
             }
 
             auto finish = std::chrono::steady_clock::now();
