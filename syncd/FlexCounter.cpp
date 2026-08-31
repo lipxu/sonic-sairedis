@@ -4177,6 +4177,7 @@ void FlexCounter::flexCounterThreadRunFunction()
     };
 
     uint64_t consecutivePollFailures = 0;
+    uint64_t consecutiveConnectFailures = 0;
 
     while (m_runFlexCounterThread)
     {
@@ -4190,6 +4191,8 @@ void FlexCounter::flexCounterThreadRunFunction()
             try
             {
                 connectCountersDb();
+
+                consecutiveConnectFailures = 0;
 
                 SWSS_LOG_NOTICE("FC %s: COUNTERS_DB connection established",
                         m_instanceId.c_str());
@@ -4213,8 +4216,14 @@ void FlexCounter::flexCounterThreadRunFunction()
 
             if (connectFailed)
             {
-                SWSS_LOG_ERROR("FC %s: failed to connect to COUNTERS_DB: %s",
-                        m_instanceId.c_str(), failureReason.c_str());
+                // Rate limit exactly as the poll path does: a sustained
+                // COUNTERS_DB outage would otherwise log once per backoff
+                // interval, for every counter group, for as long as it lasts.
+                if ((consecutiveConnectFailures++ % FLEX_COUNTER_POLL_FAILURE_LOG_INTERVAL) == 0)
+                {
+                    SWSS_LOG_ERROR("FC %s: failed to connect to COUNTERS_DB (%" PRIu64 " consecutive): %s",
+                            m_instanceId.c_str(), consecutiveConnectFailures, failureReason.c_str());
+                }
 
                 // m_pollInterval is written by setPollInterval() with m_mtx held,
                 // so reading it here without the lock is a data race. Take a
