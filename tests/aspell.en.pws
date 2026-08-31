@@ -540,3 +540,5 @@ SIGABRT
 backoff
 desync
 rebuildable
+jitter
+jittered
