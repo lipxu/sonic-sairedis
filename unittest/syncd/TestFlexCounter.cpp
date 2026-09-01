@@ -3094,3 +3094,93 @@ TEST(FlexCounter, pollLoopSurvivesThrowAndRecovers)
     removeTimeStamp(keys, countersTable);
     ASSERT_TRUE(keys.empty());
 }
+
+/*
+ * Forces every COUNTERS_DB connect attempt to fail by pointing the database at
+ * a unix socket that does not exist. ENOENT is deterministic, unlike an
+ * unreachable TCP endpoint, which depends on whether the sandbox refuses the
+ * connection or silently drops it.
+ */
+class FlexCounterCountersDbUnreachable : public ::testing::Test
+{
+protected:
+    static constexpr const char *configPath = "/tmp/test_counters_db_unreachable_config.json";
+    static constexpr const char *sockPath = "/tmp/test_counters_db_unreachable.sock";
+
+    void SetUp() override
+    {
+        const std::string configContent = R"({
+            "INSTANCES": {
+                "redis": {
+                    "hostname": "127.0.0.1",
+                    "port": 6379,
+                    "unix_socket_path": ")" + std::string(sockPath) + R"("
+                }
+            },
+            "DATABASES": {
+                "COUNTERS_DB": {
+                    "id": 2,
+                    "separator": ":",
+                    "instance": "redis"
+                }
+            },
+            "VERSION": "1.0"
+        })";
+
+        std::remove(sockPath);
+
+        std::ofstream ofs(configPath);
+        ofs << configContent;
+        ofs.close();
+
+        swss::SonicDBConfig::reset();
+        swss::SonicDBConfig::initialize(configPath);
+    }
+
+    void TearDown() override
+    {
+        std::remove(configPath);
+        swss::SonicDBConfig::reset();
+        swss::SonicDBConfig::initialize();
+    }
+};
+
+TEST_F(FlexCounterCountersDbUnreachable, pollLoopSurvivesCountersDbConnectFailure)
+{
+    // The poll loop drops its COUNTERS_DB handles after a failed cycle and
+    // rebuilds them on the next pass, so the reconnect can fail in its own
+    // right -- COUNTERS_DB is frequently still down when the retry lands. That
+    // reconnect runs on the same std::thread as the poll, with no handler above
+    // it, so an exception escaping it would call std::terminate() and abort
+    // syncd exactly as the unguarded poll failure did.
+    //
+    // This test has the same shape as pollLoopSurvivesThrowAndRecovers: without
+    // the guard it does not fail, it aborts the test binary.
+
+    ASSERT_FALSE(swss::SonicDBConfig::getDbSock("COUNTERS_DB").empty())
+        << "fixture must select unix socket mode, otherwise the connect would "
+           "fall back to TCP and could succeed against a live redis";
+
+    FlexCounter fc("test_connect_failure", sai, "COUNTERS_DB");
+
+    // Shortens the reconnect backoff from FLEX_COUNTER_RECONNECT_BACKOFF_MS to
+    // 100ms. setPollInterval() notifies the sleep condition variable, so the
+    // wait already under way is cut short instead of running to completion.
+    std::vector<swss::FieldValueTuple> pluginValues;
+    pluginValues.emplace_back(POLL_INTERVAL_FIELD, "100");
+    pluginValues.emplace_back(FLEX_COUNTER_STATUS_FIELD, "enable");
+    pluginValues.emplace_back(STATS_MODE_FIELD, STATS_MODE_READ);
+    fc.addCounterPlugin(pluginValues);
+
+    // Nothing is published while COUNTERS_DB is unreachable, so there is no
+    // event to poll for and the wait is a fixed one. That is sound here because
+    // the property under test is that retries keep happening: overshooting only
+    // adds retries, it cannot turn a pass into a failure.
+    usleep(1000 * 1000);
+
+    // Also asserts the reconnect path stays outside the counter mutex, as the
+    // comment on the connect in flexCounterThreadRunFunction() promises: this
+    // call takes that mutex, so it would block here for as long as COUNTERS_DB
+    // stayed down if the backoff wait were ever moved inside it.
+    EXPECT_TRUE(fc.isEmpty());
+}
